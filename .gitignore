@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Airflow runtime
+logs/
+airflow.db
+airflow-webserver.pid
+standalone_admin_password.txt
+
+# Local data dumps (the card seed is versioned)
+data/*
+!data/cards_seed.json
+*.parquet
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

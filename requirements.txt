@@ -1,0 +1,30 @@
+# -----------------------------------------------------------------------------
+# Runtime dependencies baked into the Airflow image (docker/airflow/Dockerfile).
+#
+# Versions are intentionally left open here: the Dockerfile installs them
+# against Airflow's official constraints file, which pins every package to a
+# combination tested with this exact Airflow release.
+#
+# NOTE: Airflow 2.x requires SQLAlchemy 1.4 — write models/queries against the
+# 1.4 API with `future=True` style so they port cleanly to 2.0 later.
+# -----------------------------------------------------------------------------
+
+# Airflow providers (hooks for the warehouse and the S3-compatible lake)
+apache-airflow-providers-postgres
+apache-airflow-providers-amazon
+
+# Warehouse access
+SQLAlchemy>=1.4,<2.0
+psycopg2-binary
+alembic
+
+# Object storage (MinIO via the S3 API)
+boto3
+
+# Extraction
+requests
+tenacity
+
+# Transformation & scoring
+pandas
+polars

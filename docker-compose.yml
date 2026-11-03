@@ -1,0 +1,191 @@
+# =============================================================================
+# DeckSupreme local stack
+#   postgres           PostgreSQL 16 — warehouse DB + separate Airflow metadata DB
+#   minio              S3-compatible raw data lake
+#   minio-init         one-shot: creates the raw bucket if missing
+#   airflow-init       one-shot: migrates Airflow metadata DB, creates admin user
+#   airflow-webserver  UI on :8080
+#   airflow-scheduler  LocalExecutor (tasks run as scheduler subprocesses)
+#
+# Usage: make env && make up && make verify
+# =============================================================================
+name: decksupreme
+
+x-minio-image: &minio-image ${MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z}
+
+x-airflow-env: &airflow-env
+  # --- Airflow core ---
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__PARALLELISM: "8"
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?run `make env` to generate AIRFLOW_FERNET_KEY}
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in .env}@postgres:5432/${AIRFLOW_DB_NAME:-airflow}
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY:?run `make env` to generate AIRFLOW_WEBSERVER_SECRET_KEY}
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+  PYTHONPATH: /opt/airflow/src
+
+  # --- Airflow connections (JSON form avoids URL-encoding pitfalls) ---
+  AIRFLOW_CONN_DECKSUPREME_WAREHOUSE: >-
+    {"conn_type": "postgres", "host": "postgres", "port": 5432,
+     "login": "${POSTGRES_USER}", "password": "${POSTGRES_PASSWORD}", "schema": "${POSTGRES_DB}"}
+  AIRFLOW_CONN_MINIO_S3: >-
+    {"conn_type": "aws", "login": "${MINIO_ROOT_USER}", "password": "${MINIO_ROOT_PASSWORD}",
+     "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1"}}
+
+  # --- DeckSupreme app settings (read by decksupreme.config) ---
+  CLASH_ROYALE_API_KEY: ${CLASH_ROYALE_API_KEY:-}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"            # in-network port; the .env value is the host port
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  POSTGRES_DB: ${POSTGRES_DB}
+  MINIO_ENDPOINT: http://minio:9000 # in-network endpoint; the .env value is for the host
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  MINIO_BUCKET: ${MINIO_BUCKET:-decksupreme-raw}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GITHUB_REPO: ${GITHUB_REPO:-}
+  GITHUB_BRANCH: ${GITHUB_BRANCH:-main}
+  SCORING_WEIGHTS: ${SCORING_WEIGHTS:-}
+  SCORING_MIN_MATCHES: ${SCORING_MIN_MATCHES:-1}
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION:-2.11.1}
+      PYTHON_VERSION: "3.11"
+  image: decksupreme-airflow:${AIRFLOW_VERSION:-2.11.1}
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: *airflow-env
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./src:/opt/airflow/src
+    - ./rankings:/opt/airflow/rankings
+    - ./data:/opt/airflow/data:ro
+    - ./scripts:/opt/airflow/scripts:ro
+    - airflow-logs:/opt/airflow/logs
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      # consumed by docker/postgres/init/01-create-airflow-db.sh on first boot
+      AIRFLOW_DB_USER: ${AIRFLOW_DB_USER:-airflow}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      AIRFLOW_DB_NAME: ${AIRFLOW_DB_NAME:-airflow}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # -h forces TCP, so this only passes once init scripts have finished and
+      # the real server is listening (the init-phase server is socket-only).
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio:
+    image: *minio-image
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  minio-init:
+    image: *minio-image   # the server image ships the `mc` client
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET:-decksupreme-raw}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set lake http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null
+        mc mb --ignore-existing "lake/$$MINIO_BUCKET"
+        mc anonymous set none "lake/$$MINIO_BUCKET"
+        echo "bucket ready: $$MINIO_BUCKET"
+    restart: "no"
+
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in .env}
+      _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+      _AIRFLOW_WWW_USER_FIRSTNAME: Deck
+      _AIRFLOW_WWW_USER_LASTNAME: Supreme
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
+    depends_on: &airflow-depends
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "-s", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on: *airflow-depends
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "-s", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:
