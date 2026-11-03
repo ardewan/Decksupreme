@@ -140,7 +140,7 @@ def load_settings() -> Settings:
         ),
         scoring=ScoringSettings(
             weights=parse_weights(_get("SCORING_WEIGHTS")),
-            min_matches=int(_get("SCORING_MIN_MATCHES", "1")),
+            min_matches=int(_get("SCORING_MIN_MATCHES", "100")),
         ),
     )
 

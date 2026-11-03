@@ -51,7 +51,7 @@ x-airflow-env: &airflow-env
   GITHUB_REPO: ${GITHUB_REPO:-}
   GITHUB_BRANCH: ${GITHUB_BRANCH:-main}
   SCORING_WEIGHTS: ${SCORING_WEIGHTS:-}
-  SCORING_MIN_MATCHES: ${SCORING_MIN_MATCHES:-1}
+  SCORING_MIN_MATCHES: ${SCORING_MIN_MATCHES:-100}
 
 x-airflow-common: &airflow-common
   build:

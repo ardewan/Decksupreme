@@ -103,17 +103,22 @@ make rank args="--year 2026 --week 45"
   The seed stores per-unit stats, so the formulas multiply by unit count.
 - **Score:** each feature is min-max scaled over active cards (a constant feature scales to 0),
   then weighted by `SCORING_WEIGHTS` (default `wr=0.35,ur=0.25,ape=0.15,dpe=0.15,ss=0.10`).
-- **Cards with unknown stats** (placeholders, Mirror) are scored on their known features with the
-  weights renormalised. They're flagged `missing_features` in JSON and marked `*` in the report.
+- **Only eligible cards are ranked:** every stat known and at least `SCORING_MIN_MATCHES` deck
+  appearances (default 100). Everything else is listed under **Unranked** with a reason:
+  `stats_pending` (in the seed without stats), `variable_cost` (Mirror, never ranked) or
+  `below_min_matches`. Unranked cards don't affect the min-max scaling.
 - **Ties** break by WR → APE → DPE → speed → UR (all desc), then name (asc).
 - **Output:** `rankings/latest.json`, `rankings/rankings_YYYY_WW.json` and `rankings/README.md`.
   Risers/fallers compare against the previous ISO week's archive when it exists.
-- `SCORING_MIN_MATCHES` (default 1) drops low-sample cards from the ranking.
 
 ## Weekly DAG & GitHub publishing (Task 6)
 
 `dags/weekly_ranking_dag.py` (`decksupreme_weekly_rankings`) runs **Mondays 06:00 UTC**:
-`extract → transform_load → score → publish`.
+`extract → transform_load → score → publish`. After the load, a report-only `check_cards`
+task compares `dim_cards` with `GET /v1/cards` and logs new cards, stats still missing from the
+seed, cost changes and renames. It never fails the run; you can also run `make check-cards`.
+The API has no HP/DPS, so new cards' stats still have to be added to `data/cards_seed.json`
+by hand (then `make seed`).
 
 ```bash
 make pipeline                          # unpause + trigger a run now (watch it at :8080)

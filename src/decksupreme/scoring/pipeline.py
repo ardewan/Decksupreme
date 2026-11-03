@@ -20,7 +20,7 @@ from decksupreme.publish.artifacts import (
     write_markdown,
 )
 from decksupreme.scoring.metrics import fetch_window_metrics
-from decksupreme.scoring.ranker import rank_cards, validate_weights
+from decksupreme.scoring.ranker import rank_cards, unranked_cards, validate_weights
 from decksupreme.transform.mapper import week_id as make_week_id
 
 log = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ def run_scoring_and_artifacts(
     if window.n_total == 0:
         raise ScoringError(f"no matches in the warehouse for week {wid}; run the load first")
     ranked = rank_cards(window.cards, weights, min_matches)
+    unranked = unranked_cards(window.cards, min_matches)
     if not ranked:
         raise ScoringError(f"no cards met min_matches={min_matches} in week {wid}")
 
@@ -68,6 +69,7 @@ def run_scoring_and_artifacts(
         weights=weights,
         min_matches=min_matches,
         ranked=ranked,
+        unranked=unranked,
     )
     previous = load_previous(out_dir, year, week)
     moves = movers(payload, previous)
@@ -82,7 +84,8 @@ def run_scoring_and_artifacts(
         "total_cards_ranked": len(ranked),
         "top_card": {"name": top.name, "score": round(top.score, 4)},
         "lowest_card": {"name": bottom.name, "score": round(bottom.score, 4)},
-        "incomplete_cards": [r.name for r in ranked if r.missing_features],
+        "total_cards_unranked": len(unranked),
+        "unranked": {u.name: u.reasons for u in unranked},
         "compared_with_previous_week": previous is not None,
         "risers": moves["risers"],
         "fallers": moves["fallers"],

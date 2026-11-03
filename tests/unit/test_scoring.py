@@ -20,7 +20,14 @@ from decksupreme.publish.artifacts import (
     write_json_artifacts,
 )
 from decksupreme.scoring.metrics import CardMetrics, compute_card_metrics
-from decksupreme.scoring.ranker import composite, min_max, rank_cards, validate_weights
+from decksupreme.scoring.ranker import (
+    composite,
+    min_max,
+    rank_cards,
+    unranked_cards,
+    unranked_reasons,
+    validate_weights,
+)
 
 NOW = datetime(2026, 11, 2, 18, 0, tzinfo=UTC)
 
@@ -126,13 +133,43 @@ def test_min_matches_excludes_inactive_cards():
     assert [r.name for r in ranked] == ["A"]
 
 
-def test_card_with_unknown_features_is_flagged_not_zeroed():
-    full = card("Full", wr=0.5)
+def test_card_with_unknown_stats_is_unranked_not_zeroed():
     new = card("New", wr=0.6, ape=None, dpe=None, ss=None)
-    ranked = {r.name: r for r in rank_cards([full, new, card("Base", wr=0.4)])}
-    assert ranked["New"].missing_features == ["ape", "dpe", "ss"]
-    assert ranked["New"].score > 0
-    assert ranked["Full"].missing_features == []
+    cards = [card("Full", wr=0.5), new, card("Base", wr=0.4)]
+    assert [r.name for r in rank_cards(cards)] == ["Full", "Base"]
+    (u,) = unranked_cards(cards)
+    assert (u.name, u.reasons) == ("New", ["stats_pending"])
+    assert u.missing_features == ["ape", "dpe", "ss"]
+
+
+@pytest.mark.parametrize(
+    ("kw", "min_matches", "reasons"),
+    [
+        ({}, 100, []),
+        ({"matches": 99}, 100, ["below_min_matches"]),
+        ({"ape": None}, 100, ["stats_pending"]),
+        ({"elixir": None, "ape": None, "dpe": None}, 1, ["variable_cost"]),
+        ({"elixir": None, "ape": None, "dpe": None, "matches": 5}, 100,
+         ["variable_cost", "below_min_matches"]),
+        ({"ss": None, "matches": 10}, 100, ["stats_pending", "below_min_matches"]),
+    ],
+)
+def test_unranked_reasons(kw, min_matches, reasons):
+    assert unranked_reasons(card("X", **kw), min_matches) == reasons
+
+
+def test_unranked_cards_do_not_affect_min_max_bounds():
+    """A 10-deck 0% card used to anchor WR at 0; now it can't move the scale."""
+    a, b = card("A", wr=0.45), card("B", wr=0.55)
+    noise = card("Noise", wr=0.0, matches=10)
+    with_noise = {r.name: r.normalized["wr"] for r in rank_cards([a, b, noise], min_matches=100)}
+    assert with_noise == {"A": 0.0, "B": 1.0}
+    assert [u.name for u in unranked_cards([a, b, noise], 100)] == ["Noise"]
+
+
+def test_unranked_sorted_by_decks_desc():
+    cards = [card("Lo", matches=5), card("Hi", matches=50), card("Mid", matches=20)]
+    assert [u.name for u in unranked_cards(cards, 100)] == ["Hi", "Mid", "Lo"]
 
 
 # -- tie-breaking ----------------------------------------------------------
@@ -176,10 +213,8 @@ def test_tie_break_priority_order():
     assert _order([b, a], ONLY_UR) == ["A", "B"]
 
 
-def test_unknown_values_sort_after_known():
-    a = card("A", ape=None)
-    b = card("B", ape=1.0)
-    assert _order([a, b], ONLY_UR) == ["B", "A"]
+def test_cards_with_unknown_values_are_not_ranked():
+    assert _order([card("A", ape=None), card("B", ape=1.0)], ONLY_UR) == ["B"]
 
 
 def test_float_noise_does_not_break_ties():
@@ -195,13 +230,18 @@ def test_ranking_is_order_independent():
 
 
 # -- artifacts -------------------------------------------------------------
-def _payload(cards=None, week="2026-45", now=NOW):
-    ranked = rank_cards(cards or [
+def _payload(cards=None, week="2026-45", now=NOW, min_matches=100):
+    cards = cards or [
         card("Hog Rider", wr=0.55, ur=0.3, cid=1), card("Knight", wr=0.5, ur=0.2, cid=2),
-        card("Mirror", wr=0.45, ur=0.05, ape=None, dpe=None, ss=None, cid=3, elixir=None),
-    ])
+        card("Mirror", wr=0.45, ur=0.05, ape=None, dpe=None, ss=None, cid=3, elixir=None,
+             matches=280),
+        card("Rune Giant", wr=0.63, ur=0.002, cid=4, matches=81),
+        card("Vines", wr=0.5, ur=0.03, ape=None, dpe=None, ss=None, cid=5, matches=1488),
+    ]
     return build_payload(week_id=week, generated_at=now, total_matches=21273,
-                         weights=DEFAULT_WEIGHTS, min_matches=1, ranked=ranked)
+                         weights=DEFAULT_WEIGHTS, min_matches=min_matches,
+                         ranked=rank_cards(cards, min_matches=min_matches),
+                         unranked=unranked_cards(cards, min_matches))
 
 
 def test_payload_schema_is_valid():
@@ -211,6 +251,8 @@ def test_payload_schema_is_valid():
     assert p["metadata"]["generated_at"] == "2026-11-02T18:00:00+00:00"
     assert p["metadata"]["total_matches_analyzed"] == 21273
     assert p["metadata"]["weights_used"] == DEFAULT_WEIGHTS
+    assert p["metadata"]["total_cards_unranked"] == 3
+    assert p["metadata"]["schema_version"] == 2
     first = p["cards"][0]
     assert first["rank"] == 1
     assert set(first["raw"]) >= {"win_rate", "usage_rate", "attack_per_elixir",
@@ -227,6 +269,11 @@ def test_payload_schema_is_valid():
         lambda p: p["cards"][0].update(rank=2),
         lambda p: p["cards"][0]["normalized"].update(win_rate=1.5),
         lambda p: p["metadata"]["weights_used"].update(wr=0.9),
+        lambda p: p.pop("unranked"),
+        lambda p: p["metadata"].update(total_cards_unranked=0),
+        lambda p: p["unranked"][0].update(reasons=[]),
+        lambda p: p["unranked"][0].update(reasons=["bogus"]),
+        lambda p: p["unranked"][0].update(card_id=p["cards"][0]["card_id"]),
     ],
 )
 def test_schema_validation_rejects_bad_payloads(mutate):
@@ -271,12 +318,18 @@ def test_markdown_rendering():
     assert "2026-11-02T18:00:00+00:00" in md and "21,273" in md
     assert "| Rank | Card | Score | Win Rate | Usage Rate | Elixir | APE | DPE | Speed |" in md
     rows = [ln for ln in md.splitlines() if ln.startswith("| ") and ln[2].isdigit()]
-    assert len(rows) == 3
+    assert len(rows) == 2
     assert rows[0].startswith("| 1 | Hog Rider |")
     assert "55.0%" in rows[0]
-    mirror = next(r for r in rows if "Mirror" in r)
-    assert "\\*" in mirror and "| — |" in mirror
+    assert "2 cards ranked, 3 unranked (see below)." in md
+    assert "at least 100 decks" in md
     assert "No previous week" in md
+    unranked = md.split("## Unranked", 1)[1]
+    assert "| Vines | 1,488 | 50.0% | 3.0% | Card stats not in the seed yet |" in unranked
+    mirror_row = "| Mirror | 280 | 45.0% | 5.0% | Variable elixir cost (Mirror); never ranked |"
+    assert mirror_row in unranked
+    assert "| Rune Giant | 81 | 63.0% | 0.2% | Too few decks this week (< 100) |" in unranked
+    assert unranked.index("Vines") < unranked.index("Mirror") < unranked.index("Rune Giant")
 
 
 def test_markdown_movers_section():

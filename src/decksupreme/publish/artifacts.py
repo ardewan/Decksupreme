@@ -15,9 +15,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from decksupreme.scoring.ranker import RankedCard
+from decksupreme.scoring.ranker import UNRANKED_REASONS, RankedCard, UnrankedCard
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: adds `unranked` + metadata.total_cards_unranked
 DEFAULT_RANKINGS_DIR = Path(__file__).resolve().parents[3] / "rankings"
 FEATURE_LABELS = {
     "wr": "Win rate", "ur": "Usage rate", "ape": "Attack/elixir",
@@ -48,6 +48,7 @@ def build_payload(
     weights: Mapping[str, float],
     min_matches: int,
     ranked: Sequence[RankedCard],
+    unranked: Sequence[UnrankedCard] = (),
 ) -> dict[str, Any]:
     return {
         "metadata": {
@@ -56,17 +57,19 @@ def build_payload(
             "generated_at": generated_at.isoformat(timespec="seconds"),
             "total_matches_analyzed": total_matches,
             "total_cards_ranked": len(ranked),
+            "total_cards_unranked": len(unranked),
             "weights_used": {k: weights[k] for k in FEATURE_LABELS},
             "min_matches": min_matches,
         },
         "cards": [r.to_dict() for r in ranked],
+        "unranked": [u.to_dict() for u in unranked],
     }
 
 
 _META_TYPES = {
     "schema_version": int, "week_id": str, "generated_at": str,
-    "total_matches_analyzed": int, "total_cards_ranked": int, "weights_used": dict,
-    "min_matches": int,
+    "total_matches_analyzed": int, "total_cards_ranked": int, "total_cards_unranked": int,
+    "weights_used": dict, "min_matches": int,
 }
 _CARD_TYPES = {
     "rank": int, "card_id": int, "name": str, "composite_score": (int, float),
@@ -95,6 +98,21 @@ def validate_payload(payload: Mapping[str, Any]) -> None:
         problems.append("metadata.weights_used must sum to 1")
     if meta.get("total_cards_ranked") != len(cards):
         problems.append("metadata.total_cards_ranked != len(cards)")
+    unranked = payload.get("unranked")
+    if not isinstance(unranked, list):
+        problems.append("unranked must be a list")
+    else:
+        if meta.get("total_cards_unranked") != len(unranked):
+            problems.append("metadata.total_cards_unranked != len(unranked)")
+        ranked_ids = {c.get("card_id") for c in cards}
+        for i, u in enumerate(unranked):
+            reasons = u.get("reasons")
+            if not isinstance(reasons, list) or not reasons:
+                problems.append(f"unranked[{i}].reasons must be a non-empty list")
+            elif not set(reasons) <= set(UNRANKED_REASONS):
+                problems.append(f"unranked[{i}].reasons has unknown values {reasons}")
+            if u.get("card_id") in ranked_ids:
+                problems.append(f"unranked[{i}] ({u.get('name')}) is also ranked")
     for i, c in enumerate(cards):
         for k, t in _CARD_TYPES.items():
             if not isinstance(c.get(k), t):
@@ -169,10 +187,14 @@ def render_markdown(
         "",
         f"Generated **{meta['generated_at']}** from **{meta['total_matches_analyzed']:,}** "
         f"ladder matches played by the top 1,000 players. "
-        f"{meta['total_cards_ranked']} cards ranked.",
+        f"{meta['total_cards_ranked']} cards ranked"
+        + (f", {meta['total_cards_unranked']} unranked (see below)."
+           if meta.get("total_cards_unranked") else "."),
         "",
         "Score = " + " + ".join(f"{w[k]:.2f}×{label}" for k, label in FEATURE_LABELS.items())
-        + " (each min-max scaled to 0–1 across ranked cards).",
+        + " (each min-max scaled to 0–1 across ranked cards). "
+        f"A card is ranked once its stats are known and it appears in at least "
+        f"{meta['min_matches']:,} decks.",
         "",
         "## Meta movers",
         "",
@@ -199,26 +221,37 @@ def render_markdown(
         "| Rank | Card | Score | Win Rate | Usage Rate | Elixir | APE | DPE | Speed |",
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    flagged = False
     for c in payload["cards"]:
         raw = c["raw"]
-        mark = ""
-        if c["missing_features"]:
-            mark, flagged = " \\*", True
         lines.append(
-            f"| {c['rank']} | {c['name']}{mark} | {c['composite_score']:.3f} | "
+            f"| {c['rank']} | {c['name']} | {c['composite_score']:.3f} | "
             f"{raw['win_rate'] * 100:.1f}% | {raw['usage_rate'] * 100:.1f}% | "
             f"{c['elixir'] if c['elixir'] is not None else '—'} | "
             f"{_num(raw['attack_per_elixir'], '.1f')} | {_num(raw['defense_per_elixir'], '.1f')} | "
             f"{_num(raw['speed_score'], '.0f')} |"
         )
     lines.append("")
-    if flagged:
+
+    unranked = payload.get("unranked") or []
+    if unranked:
         lines += [
-            "\\* Card stats not in the seed yet (new card or variable cost). "
-            "Scored on the known features only, with weights renormalised.",
+            "## Unranked",
             "",
+            "Tracked but not scored this week. Win rate and usage are shown for reference.",
+            "",
+            "| Card | Decks | Win Rate | Usage Rate | Why |",
+            "|---|---:|---:|---:|---|",
         ]
+        for u in unranked:
+            why = "; ".join(UNRANKED_REASONS[r] for r in u["reasons"])
+            if "below_min_matches" in u["reasons"]:
+                why = why.replace("Too few decks this week",
+                                  f"Too few decks this week (< {meta['min_matches']:,})")
+            lines.append(
+                f"| {u['name']} | {u['matches']:,} | {u['win_rate'] * 100:.1f}% | "
+                f"{u['usage_rate'] * 100:.1f}% | {why} |"
+            )
+        lines.append("")
     lines += [
         "_APE = attack DPS × units ÷ elixir (spells: total damage ÷ elixir). "
         "DPE = HP × units ÷ elixir. Usage rate = share of decks containing the card. "

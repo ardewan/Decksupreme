@@ -47,14 +47,19 @@ def test_aggregates_match_sample(loaded):
 
 
 def test_scoring_pipeline_writes_artifacts(loaded, tmp_path):
-    summary = run_scoring_and_artifacts(2026, 45, engine=loaded, out_dir=tmp_path)
+    summary = run_scoring_and_artifacts(2026, 45, engine=loaded, out_dir=tmp_path, min_matches=1)
     assert summary["total_matches_analyzed"] == 5
-    assert summary["total_cards_ranked"] == 18  # 16 deck cards + Minion Giant + Mirror
-    assert set(summary["incomplete_cards"]) == {"Mirror", "Minion Giant"}
+    assert summary["total_cards_ranked"] == 16  # the sample's two full decks
+    assert summary["unranked"] == {"Minion Giant": ["stats_pending"], "Mirror": ["variable_cost"]}
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert latest == json.loads((tmp_path / "rankings_2026_45.json").read_text())
     assert latest["cards"][0]["name"] == summary["top_card"]["name"]
     assert (tmp_path / "README.md").read_text().startswith("# DeckSupreme Card Rankings")
+
+
+def test_default_min_matches_leaves_tiny_sample_unranked(loaded, tmp_path):
+    with pytest.raises(ScoringError, match="min_matches=100"):
+        run_scoring_and_artifacts(2026, 45, engine=loaded, out_dir=tmp_path, min_matches=100)
 
 
 def test_scoring_empty_week_raises(loaded, tmp_path):

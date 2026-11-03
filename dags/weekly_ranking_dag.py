@@ -1,4 +1,5 @@
-"""Weekly DeckSupreme pipeline: extract -> transform/load -> score -> publish.
+"""Weekly DeckSupreme pipeline: extract -> transform/load -> score -> publish,
+plus a report-only check_cards branch after the load (flags seed maintenance).
 
 Runs Mondays 06:00 UTC. Every task is idempotent for its week, so rerunning a
 failed run (or one task) is safe:
@@ -84,7 +85,24 @@ def decksupreme_weekly_rankings():
 
         return publish_rankings(scored["year"], scored["week"]).to_dict()
 
-    publish(score(transform_load(extract())))
+    @task(execution_timeout=timedelta(minutes=5), retries=0)
+    def check_cards(_loaded: dict) -> dict:
+        """Report-only: compare dim_cards with GET /v1/cards (new cards, stats still
+        missing from the seed, cost changes). Never fails the run; read the warnings
+        in this task's log or its XCom."""
+        from decksupreme.extract.card_check import run_card_check
+
+        try:
+            return run_card_check().to_dict()
+        except Exception as exc:  # noqa: BLE001 - advisory check must not block publishing
+            import logging
+
+            logging.getLogger(__name__).warning("card check could not run: %s", exc)
+            return {"error": str(exc)}
+
+    loaded = transform_load(extract())
+    publish(score(loaded))
+    check_cards(loaded)
 
 
 decksupreme_weekly_rankings()

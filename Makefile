@@ -1,6 +1,6 @@
 DC := docker compose
 
-.PHONY: help env build up down restart ps logs verify nuke init-db seed extract load rank publish pipeline test test-integration lint psql
+.PHONY: help env build up down restart ps logs verify nuke init-db seed extract load rank publish check-cards pipeline test test-integration lint psql
 
 help:          ## Show targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*## "}{printf "  %-10s %s\n",$$1,$$2}'
@@ -48,6 +48,9 @@ rank:          ## Tasks 4+5: score cards, write rankings/ (make rank args="--yea
 
 publish:       ## Task 6: commit rankings/ to GitHub (skips if GITHUB_* unset)
 	$(DC) exec -T airflow-scheduler python /opt/airflow/scripts/run_publish.py $(args)
+
+check-cards:   ## Compare dim_cards with the API card list (new cards, missing stats, cost changes)
+	$(DC) exec -T airflow-scheduler python /opt/airflow/scripts/check_cards.py
 
 pipeline:      ## Trigger the weekly DAG now (unpauses it first)
 	$(DC) exec -T airflow-scheduler airflow dags unpause decksupreme_weekly_rankings

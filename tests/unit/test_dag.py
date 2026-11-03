@@ -29,9 +29,12 @@ def test_weekly_dag_shape(dagbag):
     assert dag.schedule_interval == "0 6 * * 1"
     assert dag.catchup is False
     assert dag.max_active_runs == 1
-    assert [t.task_id for t in dag.topological_sort()] == [
-        "extract", "transform_load", "score", "publish",
-    ]
+    tasks = dag.task_dict
+    assert set(tasks) == {"extract", "transform_load", "score", "publish", "check_cards"}
+    assert tasks["extract"].downstream_task_ids == {"transform_load"}
+    assert tasks["transform_load"].downstream_task_ids == {"score", "check_cards"}
+    assert tasks["score"].downstream_task_ids == {"publish"}
+    assert tasks["publish"].downstream_task_ids == set()
     for t in dag.tasks:
-        assert t.retries == 2
+        assert t.retries == (0 if t.task_id == "check_cards" else 2)
         assert t.execution_timeout is not None
